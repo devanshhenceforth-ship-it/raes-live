@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+opencv-python
+ffmpeg-python
+langchain-google-genai
+python-dotenv
+websockets
+python-multipart
+pydantic
+aiofiles

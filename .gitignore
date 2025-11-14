@@ -1,0 +1,4 @@
+.venv
+.env
+/frontend
+/uploaded_videos
