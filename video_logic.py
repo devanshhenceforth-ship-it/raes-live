@@ -61,3 +61,23 @@ def extract_video_screenshots(video_path: str, every_n_frames=50):
         }
     ]
     return hardcoded_screenshots
+
+
+
+def get_frame(video_path, timestamp_sec):
+    """
+    Extracts a frame from video at the given timestamp (in seconds)
+    and returns it as an image array suitable for st.image
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_number = int(fps * timestamp_sec)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+    ret, frame = cap.read()
+    cap.release()
+    
+    if ret:
+        # Convert BGR to RGB
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return frame
+    return None
