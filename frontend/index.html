@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebM Chunk Sender</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, "Segoe UI", Arial; padding: 20px; max-width: 720px; margin: auto; }
+    video { width: 100%; max-height: 360px; background: #000; border-radius: 8px; }
+    .controls { margin-top: 12px; display:flex; gap:8px; }
+    button { padding: 8px 12px; border-radius:6px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+    button:disabled { opacity:0.5; cursor: not-allowed; }
+    .log { margin-top:12px; background:#f7f7f7; padding:10px; border-radius:6px; height:160px; overflow:auto; white-space:pre-wrap; font-family:monospace; font-size:13px; }
+    label { display:flex; gap:8px; align-items:center; margin-top:8px; }
+    input[type=number] { width:80px; }
+  </style>
+</head>
+<body>
+  <h1>WebM Chunk Sender (WebSocket)</h1>
+
+  <video id="preview" autoplay muted playsinline></video>
+
+  <div class="controls">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <button id="pauseBtn" disabled>Pause</button>
+  </div>
+
+  <label>
+    Backend WebSocket URL:
+    <input id="backendUrl" type="text" value="ws://localhost:8000/stream" style="flex:1" />
+  </label>
+
+  <label>
+    Chunk interval (ms):
+    <input id="timeslice" type="number" value="1000" min="100" />
+  </label>
+
+  <div class="log" id="log"></div>
+
+  <script>
+  document.addEventListener('DOMContentLoaded', () => {
+    const preview = document.getElementById('preview');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn  = document.getElementById('stopBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const logEl = document.getElementById('log');
+    const backendInput = document.getElementById('backendUrl');
+    const timesliceInput = document.getElementById('timeslice');
+
+    let mediaStream = null;
+    let mediaRecorder = null;
+    let ws = null;
+    let chunkIndex = 0;
+
+    function log(...args) {
+      const t = new Date().toISOString();
+      logEl.textContent = `${t}  ${args.join(' ')}\n` + logEl.textContent;
+    }
+
+    async function ensureMedia() {
+      if (mediaStream) return mediaStream;
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+      preview.srcObject = mediaStream;
+      return mediaStream;
+    }
+
+    function sendChunkWS(blob, idx) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        log(`WebSocket not open, skipping chunk ${idx}`);
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const arrayBuffer = reader.result;
+        ws.send(arrayBuffer);
+        log(`Chunk ${idx} -> sent (${blob.size} bytes)`);
+      };
+      reader.readAsArrayBuffer(blob);
+    }
+
+    function createRecorder(stream, timesliceMs) {
+      let options = { mimeType: 'video/webm;codecs=vp8,opus' };
+      if (!MediaRecorder.isTypeSupported(options.mimeType)) options = { mimeType: 'video/webm' };
+      if (!MediaRecorder.isTypeSupported(options.mimeType)) options = {};
+
+      const recorder = new MediaRecorder(stream, options);
+
+      recorder.addEventListener('dataavailable', (ev) => {
+        if (!ev.data || ev.data.size === 0) return;
+        chunkIndex += 1;
+        sendChunkWS(ev.data, chunkIndex);
+      });
+
+      recorder.addEventListener('start', () => log('recorder start'));
+      recorder.addEventListener('stop',  () => log('recorder stopped'));
+      recorder.addEventListener('pause', () => log('recorder paused'));
+      recorder.addEventListener('resume', () => log('recorder resumed'));
+      recorder.addEventListener('error',  (e) => log('recorder error', e));
+
+      return recorder;
+    }
+
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true;
+      try {
+        const stream = await ensureMedia();
+        chunkIndex = 0;
+
+        const backendUrl = backendInput.value.trim();
+        ws = new WebSocket(backendUrl);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+          log('WebSocket connected');
+          const timeslice = Math.max(100, parseInt(timesliceInput.value || '1000', 10));
+          mediaRecorder = createRecorder(stream, timeslice);
+          mediaRecorder.start(timeslice);
+          stopBtn.disabled = false;
+          pauseBtn.disabled = false;
+          log('Recording started, timeslice=' + timeslice + 'ms');
+        };
+
+        ws.onmessage = (msg) => log('WS message:', msg.data);
+        ws.onerror = (err) => log('WS error:', err);
+        ws.onclose = () => log('WebSocket closed');
+
+      } catch (e) {
+        log('Failed to start recording: ' + e);
+        startBtn.disabled = false;
+      }
+    });
+
+    stopBtn.addEventListener('click', () => {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+      mediaRecorder = null;
+      ws = null;
+      stopBtn.disabled = true;
+      pauseBtn.disabled = true;
+      startBtn.disabled = false;
+      log('Recording stopped by user');
+    });
+
+    pauseBtn.addEventListener('click', () => {
+      if (!mediaRecorder) return;
+      if (mediaRecorder.state === 'recording') {
+        mediaRecorder.pause();
+        pauseBtn.textContent = 'Resume';
+      } else if (mediaRecorder.state === 'paused') {
+        mediaRecorder.resume();
+        pauseBtn.textContent = 'Pause';
+      }
+    });
+
+    window.addEventListener('beforeunload', () => {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+      if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+    });
+
+    log('Ready. Set backend WebSocket URL and press Start.');
+  });
+  </script>
+</body>
+</html>
