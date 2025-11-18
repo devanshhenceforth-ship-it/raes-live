@@ -9,3 +9,5 @@ uvicorn>=0.38.0
 websockets>=15.0.1
 python-socketio[asyncio]
 python-socketio[fastapi]
+python-multipart
+faster_whisper

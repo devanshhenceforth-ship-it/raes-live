@@ -1,205 +1,135 @@
-import subprocess
-from fastapi import APIRouter, FastAPI
-from pathlib import Path
-from collections import deque
+from fastapi import APIRouter, UploadFile, File
 import asyncio
-import cv2
-from google.genai import Client
 import os
 import base64
-from dotenv import load_dotenv
+import socketio
+import cv2
+import tempfile
+from typing import Optional
 from langchain_core.messages import HumanMessage
-from .schemas import AudioEvent, FrameSelection
 from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from .transcribe import transcribe_video_with_whisper
 
-import socketio  # <-- new import
-
+# ---------------------------------------------
+# INIT
+# ---------------------------------------------
 load_dotenv()
-# router = APIRouter()
+router = APIRouter()
 
-# ----------------- BUFFERS -----------------
-CHUNK_FILE = Path("chunk.webm")
-AUDIO_FILE = Path("audio.wav")
-FRAME_DIR = Path("frames/")
-FRAME_DIR.mkdir(exist_ok=True)
+# ---------- Schemas ---------- #
+class VideoEvent(BaseModel):
+    timestamp: int
+    task: str
+    description: str
+    category: str
 
-video_cache = deque(maxlen=10)
-audio_cache = deque(maxlen=5)
+class AllAnalyzerResponse(BaseModel):
+    issues: list[VideoEvent] = Field(..., description="List of identified tasks or issues.")
+    summary: Optional[str] = Field(None, description="Summary of the analysis.")
 
-client = Client(api_key=os.getenv("GOOGLE_API_KEY"))
+# ---------- Global LLM Setup ---------- #
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=os.getenv("GOOGLE_API_KEY"))
+structured_llm = llm.with_structured_output(AllAnalyzerResponse)
 
-# analyzer lock
-analyzing_audio = False
-
-# Setup Gemini
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    api_key=os.getenv("GOOGLE_API_KEY"),
-)
-audio_llm = llm.with_structured_output(AudioEvent)
-
-# ----------------- AUDIO ANALYSIS -----------------
-async def analyze_audio(audio_bytes: bytes):
-    print(f"[AUDIO] Analyzing audio bytes = {len(audio_bytes)}")
-    if not audio_bytes:
-        return False, None
-
-    prompt = """
-    "Analyze the attached audio for maintenance, repairs, and cleaning issues (electrical, decor, furniture, etc.). "
-    Transcribe the audio. If it contains a task, return:
-    - task_detected = true
-    - list of VideoEvent items
-    Otherwise return task_detected = false.
-    """
-    try:
-        message = HumanMessage(
-            content=[
-                {"type": "text", "text": prompt},
-                {"type": "media", "data": audio_bytes, "mime_type": "audio/wav"},
-            ]
-        )
-        data = audio_llm.invoke([message])
-    except Exception as e:
-        print("[AUDIO] ERROR calling Gemini:", e)
-        return False, None
-
-    print("[AUDIO] Parsed response:", data)
-    return data.task_detected, data
-
-# ----------------- VIDEO PROCESSING -----------------
-async def process_video_chunk(video_buffer: bytearray):
-    if not video_buffer:
-        return
-
-    CHUNK_FILE.write_bytes(video_buffer)
-    video_buffer.clear()
-
-    # extract audio
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(CHUNK_FILE),
-        "-vn", "-acodec", "pcm_s16le",
-        "-ar", "16000", "-ac", "1", str(AUDIO_FILE)
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    audio_bytes = AUDIO_FILE.read_bytes()
-    audio_cache.append(audio_bytes)
-
-    # clean frames
-    for f in FRAME_DIR.glob("frame-*.jpg"):
-        f.unlink()
-
-    # extract frames
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(CHUNK_FILE),
-        "-vf", "fps=1", str(FRAME_DIR / "frame-%03d.jpg")
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    frame_files = sorted(FRAME_DIR.glob("frame-*.jpg"))
-    for frame_file in frame_files:
-        frame = cv2.imread(str(frame_file))
-        if frame is not None:
-            video_cache.append((frame, 0))
-
-# ----------------- VIDEO ANALYSIS -----------------
-async def analyze_video():
-    global analyzing_audio
-    print("[VIDEO_ANALYZER] Started")
-
-    while True:
-        if analyzing_audio:
-            await asyncio.sleep(0.2)
-            continue
-
-        if not audio_cache or not video_cache:
-            await asyncio.sleep(0.3)
-            continue
-
-        analyzing_audio = True
-        frames_to_check = list(video_cache)
-        audio_bytes = b"".join(audio_cache)
-
-        task_triggered, data = await analyze_audio(audio_bytes)
-
-        if task_triggered:
-            images = []
-            for frame, _ in frames_to_check:
-                _, b = cv2.imencode(".jpg", frame)
-                images.append(b.tobytes())
-
-            try:
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[
-                        {"text": "Return JSON: { index: number } for best frame."},
-                        *[
-                            {"inline_data": {"data": img, "mime_type": "image/jpeg"}}
-                            for img in images
-                        ]
-                    ],
-                    config={
-                        "response_mime_type": "application/json",
-                        "response_json_schema": FrameSelection.model_json_schema()
-                    }
-                )
-            except Exception as e:
-                print("[VIDEO_ANALYZER] Gemini frame error:", e)
-                analyzing_audio = False
-                continue
-
-            try:
-                result = FrameSelection.model_validate_json(response.text)
-                idx = result.index
-            except:
-                print("[VIDEO_ANALYZER] Bad frame index:", response.text)
-                analyzing_audio = False
-                continue
-
-            chosen_frame, _ = frames_to_check[idx]
-            _, buf = cv2.imencode(".jpg", chosen_frame)
-            img_b64 = base64.b64encode(buf).decode()
-
-            # broadcast via Socket.IO
-            await sio.emit('task_detected', {
-                "image_base64": img_b64,
-                "meta": data
-            })
-
-        analyzing_audio = False
-        await asyncio.sleep(0.2)
-
-# ----------------- SOCKET.IO EVENT -----------------
-# ----------------- SOCKET.IO SETUP -----------------
+# ---------- Socket.IO Server ---------- #
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
-# global flag for analyzer
-analyzer_started = False
-sio.video_buffers = {}  # per-client buffers
-
-# ----------------- SOCKET.IO EVENT -----------------
 @sio.event
 async def connect(sid, environ):
-    global analyzer_started
-    print(f"[Socket.IO] Client connected: {sid}")
-    if not analyzer_started:
-        analyzer_started = True
-        asyncio.create_task(analyze_video())
+    print("[SOCKET] Client connected:", sid)
 
 @sio.event
 async def disconnect(sid):
-    print(f"[Socket.IO] Client disconnected: {sid}")
-    # clean up buffer
-    sio.video_buffers.pop(sid, None)
+    print("[SOCKET] Client disconnected:", sid)
 
-@sio.event
-async def video_chunk(sid, data):
-    import base64
-    chunk_bytes = base64.b64decode(data)
+# ---------------------------------------------
+# BASE64 UTILITY
+# ---------------------------------------------
+def frame_to_base64(frame) -> str:
+    _, buffer = cv2.imencode(".jpg", frame)
+    return base64.b64encode(buffer).decode()
 
-    # store in temporary buffer per client
-    if sid not in sio.video_buffers:
-        sio.video_buffers[sid] = bytearray()
-    sio.video_buffers[sid].extend(chunk_bytes)
+def get_frame_at_timestamp(video_bytes: bytes, timestamp: int) -> Optional[str]:
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
+        tmp.write(video_bytes)
+        tmp.flush()
+        cap = cv2.VideoCapture(tmp.name)
+        if not cap.isOpened():
+            return None
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        frame_number = int((timestamp / 1000) * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            return frame_to_base64(frame)
+    return None
 
-    # process chunk
-    await process_video_chunk(sio.video_buffers[sid])
+# ---------------------------------------------
+# BACKGROUND PROCESSING TASK
+# ---------------------------------------------
+async def process_video_background(video_bytes: bytes):
+    try:
+        video_b64 = base64.b64encode(video_bytes).decode()
 
+        # Prepare LLM prompt
+        prompt = (
+            "Analyze the attached office video for maintenance, repairs, and cleaning issues "
+            "(electrical, decor, furniture, etc.). "
+            "For each issue, provide a structured list with: timestamp (ms), "
+            "task name, description, and category. "
+            "Write a summary for the whole video."
+        )
+
+        message = HumanMessage(
+            content=[
+                {"type": "text", "text": prompt},
+                {"type": "media", "data": video_b64, "mime_type": "video/mp4"},
+            ]
+        )
+
+        # Run LLM in thread
+        result = await asyncio.to_thread(structured_llm.invoke, [message])
+
+        # Extract screenshots
+        screenshots = {issue.timestamp: get_frame_at_timestamp(video_bytes, issue.timestamp)
+                       for issue in result.issues}
+
+        # Emit results via Socket.IO
+        response_payload = {
+            "issues": [issue.dict() for issue in result.issues],
+            "summary": result.summary,
+            "screenshots": screenshots
+        }
+        await sio.emit("task_detected", response_payload)
+
+    except Exception as e:
+        print("[VIDEO_ANALYSIS] Error in background:", e)
+        await sio.emit("task_error", {"error": str(e)})
+
+# ---------------------------------------------
+# VIDEO UPLOAD ENDPOINT (return transcription)
+# ---------------------------------------------
+@router.post("/upload_video")
+async def upload_video(file: UploadFile = File(None)):
+    if not file:
+        return {"error": "No video provided"}
+
+    video_bytes = await file.read()
+
+    # 1️⃣ Transcribe video immediately
+    transcript_segments = await transcribe_video_with_whisper(video_bytes)
+    full_transcript = " ".join([seg["text"] for seg in transcript_segments])
+
+    # 2️⃣ Start background processing for LLM + screenshots
+    asyncio.create_task(process_video_background(video_bytes))
+
+    # 3️⃣ Return transcription immediately
+    return {
+        "status": "ok",
+        "message": "Video received. LLM analysis will be processed in background.",
+        "transcript_segments": transcript_segments,
+        "full_transcript": full_transcript
+    }
