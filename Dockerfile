@@ -1,4 +1,4 @@
-# Use Python 3.13 (stable, with good support)
+# Use Python 3.13 (slim)
 FROM python:3.13-slim
 
 # Set working directory
@@ -7,8 +7,9 @@ WORKDIR /app
 # Copy requirements
 COPY requirements.txt .
 
-# Install dependencies
+# Install dependencies + ffmpeg
 RUN apt-get update && apt-get install -y \
+        ffmpeg \
         libgl1 \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
@@ -21,5 +22,5 @@ COPY . .
 # Expose FastAPI port
 EXPOSE 9003
 
-# Run the FastAPI app using python
+# Run the FastAPI app
 CMD ["python3", "main.py"]
