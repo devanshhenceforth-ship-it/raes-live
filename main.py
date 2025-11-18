@@ -21,7 +21,7 @@ def main():
     print("Starting server on http://0.0.0.0:9003")
     uvicorn.run(
         "main:app",
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=9003,
         reload=True
     )
