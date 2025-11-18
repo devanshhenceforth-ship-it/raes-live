@@ -1,5 +1,5 @@
 import subprocess
-from fastapi import APIRouter, WebSocket
+from fastapi import APIRouter, FastAPI
 from pathlib import Path
 from collections import deque
 import asyncio
@@ -12,35 +12,10 @@ from langchain_core.messages import HumanMessage
 from .schemas import AudioEvent, FrameSelection
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+import socketio  # <-- new import
+
 load_dotenv()
-router = APIRouter()
-
-# ----------------- WS MANAGER -----------------
-class WSManager:
-    def __init__(self):
-        self.active = set()
-
-    async def connect(self, ws: WebSocket):
-        self.active.add(ws)
-        print(f"[WS] Connected clients: {len(self.active)}")
-
-    def disconnect(self, ws: WebSocket):
-        if ws in self.active:
-            self.active.remove(ws)
-            print(f"[WS] Client disconnected. Remaining: {len(self.active)}")
-
-    async def broadcast(self, data: dict):
-        print(f"[WS] Broadcasting → {len(self.active)} clients")
-        dead = []
-        for ws in self.active:
-            try:
-                await ws.send_json(data)
-            except:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
-
-ws_manager = WSManager()
+# router = APIRouter()
 
 # ----------------- BUFFERS -----------------
 CHUNK_FILE = Path("chunk.webm")
@@ -183,49 +158,48 @@ async def analyze_video():
             _, buf = cv2.imencode(".jpg", chosen_frame)
             img_b64 = base64.b64encode(buf).decode()
 
-            await ws_manager.broadcast({
-                "event": "task_detected",
+            # broadcast via Socket.IO
+            await sio.emit('task_detected', {
                 "image_base64": img_b64,
-                "meta": data.model_dump()
+                "meta": data
             })
 
         analyzing_audio = False
         await asyncio.sleep(0.2)
 
-# ----------------- WEBSOCKET ENDPOINT -----------------
-@router.websocket("/stream")
-async def stream_video(websocket: WebSocket):
-    await websocket.accept()
-    await ws_manager.connect(websocket)
+# ----------------- SOCKET.IO EVENT -----------------
+# ----------------- SOCKET.IO SETUP -----------------
+sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
-    video_buffer = bytearray()  # per-client buffer
+# global flag for analyzer
+analyzer_started = False
+sio.video_buffers = {}  # per-client buffers
 
-    # start analyzer once
-    if not hasattr(router, "analyzer_started"):
-        router.analyzer_started = True
+# ----------------- SOCKET.IO EVENT -----------------
+@sio.event
+async def connect(sid, environ):
+    global analyzer_started
+    print(f"[Socket.IO] Client connected: {sid}")
+    if not analyzer_started:
+        analyzer_started = True
         asyncio.create_task(analyze_video())
 
-    # background task for processing chunks
-    async def chunk_processor():
-        while True:
-            try:
-                if video_buffer:
-                    await process_video_chunk(video_buffer)
-            except Exception as e:
-                print("[CHUNK_PROCESSOR] Error:", e)
-            await asyncio.sleep(0.05)
+@sio.event
+async def disconnect(sid):
+    print(f"[Socket.IO] Client disconnected: {sid}")
+    # clean up buffer
+    sio.video_buffers.pop(sid, None)
 
-    processor_task = asyncio.create_task(chunk_processor())
+@sio.event
+async def video_chunk(sid, data):
+    import base64
+    chunk_bytes = base64.b64decode(data)
 
-    try:
-        while True:
-            try:
-                chunk = await websocket.receive_bytes()
-                video_buffer.extend(chunk)
-            except Exception as e:
-                print("[WS] Receive error:", e)
-                break
+    # store in temporary buffer per client
+    if sid not in sio.video_buffers:
+        sio.video_buffers[sid] = bytearray()
+    sio.video_buffers[sid].extend(chunk_bytes)
 
-    finally:
-        processor_task.cancel()
-        ws_manager.disconnect(websocket)
+    # process chunk
+    await process_video_chunk(sio.video_buffers[sid])
+

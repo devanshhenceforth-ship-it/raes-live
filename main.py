@@ -1,9 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from src.api import router as stream_router
+from src.api import sio
 import uvicorn
+import socketio
 
 app = FastAPI()
+app.mount("/socket.io", socketio.ASGIApp(sio, other_asgi_app=app))
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,7 +16,7 @@ app.add_middleware(
 )
 
 # register your streaming route
-app.include_router(stream_router)
+# app.include_router(stream_router)
 
 
 def main():
