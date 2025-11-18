@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    container_name: demo-raes
+    env_file:
+      - .env
+    ports:
+      - "9003:9003"
+    volumes:
+      - .:/app
+    command: ["python3", "main.py"]
