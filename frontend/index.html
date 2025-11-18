@@ -11,8 +11,9 @@
     button { padding: 8px 12px; border-radius:6px; border:1px solid #ccc; background:#fff; cursor:pointer; }
     button:disabled { opacity:0.5; cursor: not-allowed; }
     .log { margin-top:12px; background:#f7f7f7; padding:10px; border-radius:6px; height:160px; overflow:auto; white-space:pre-wrap; font-family:monospace; font-size:13px; }
-    label { display:flex; gap:8px; align-items:center; margin-top:8px; }
-    input[type=number] { width:80px; }
+    #taskResult { margin-top:20px; padding:12px; background:#eef; border-radius:8px; }
+    #taskImg { width:100%; border-radius:8px; margin-top:10px; }
+    pre { background:#fff; padding:10px; border-radius:6px; }
   </style>
 </head>
 <body>
@@ -28,7 +29,7 @@
 
   <label>
     Backend WebSocket URL:
-    <input id="backendUrl" type="text" value="ws://localhost:8000/stream" style="flex:1" />
+    <input id="backendUrl" type="text" value="ws://localhost:9003/stream" style="flex:1" />
   </label>
 
   <label>
@@ -37,6 +38,13 @@
   </label>
 
   <div class="log" id="log"></div>
+
+  <!-- Task Detection Output -->
+  <div id="taskResult">
+    <h3>Detected Task</h3>
+    <img id="taskImg" />
+    <pre id="taskMeta"></pre>
+  </div>
 
   <script>
   document.addEventListener('DOMContentLoaded', () => {
@@ -47,6 +55,9 @@
     const logEl = document.getElementById('log');
     const backendInput = document.getElementById('backendUrl');
     const timesliceInput = document.getElementById('timeslice');
+
+    const taskImg = document.getElementById('taskImg');
+    const taskMeta = document.getElementById('taskMeta');
 
     let mediaStream = null;
     let mediaRecorder = null;
@@ -72,8 +83,7 @@
       }
       const reader = new FileReader();
       reader.onload = () => {
-        const arrayBuffer = reader.result;
-        ws.send(arrayBuffer);
+        ws.send(reader.result);
         log(`Chunk ${idx} -> sent (${blob.size} bytes)`);
       };
       reader.readAsArrayBuffer(blob);
@@ -86,23 +96,23 @@
 
       const recorder = new MediaRecorder(stream, options);
 
-      recorder.addEventListener('dataavailable', (ev) => {
+      recorder.ondataavailable = (ev) => {
         if (!ev.data || ev.data.size === 0) return;
         chunkIndex += 1;
         sendChunkWS(ev.data, chunkIndex);
-      });
+      };
 
-      recorder.addEventListener('start', () => log('recorder start'));
-      recorder.addEventListener('stop',  () => log('recorder stopped'));
-      recorder.addEventListener('pause', () => log('recorder paused'));
-      recorder.addEventListener('resume', () => log('recorder resumed'));
-      recorder.addEventListener('error',  (e) => log('recorder error', e));
+      recorder.onstart = () => log('recorder start');
+      recorder.onstop  = () => log('recorder stop');
+      recorder.onpause = () => log('recorder pause');
+      recorder.onresume = () => log('recorder resume');
 
       return recorder;
     }
 
     startBtn.addEventListener('click', async () => {
       startBtn.disabled = true;
+
       try {
         const stream = await ensureMedia();
         chunkIndex = 0;
@@ -113,20 +123,38 @@
 
         ws.onopen = () => {
           log('WebSocket connected');
+
           const timeslice = Math.max(100, parseInt(timesliceInput.value || '1000', 10));
           mediaRecorder = createRecorder(stream, timeslice);
           mediaRecorder.start(timeslice);
+
           stopBtn.disabled = false;
           pauseBtn.disabled = false;
           log('Recording started, timeslice=' + timeslice + 'ms');
         };
 
-        ws.onmessage = (msg) => log('WS message:', msg.data);
+        // 🆕 Handle backend detection events
+        ws.onmessage = (msg) => {
+          try {
+            const data = JSON.parse(msg.data);
+
+            if (data.event === "task_detected") {
+              taskImg.src = "data:image/jpeg;base64," + data.image_base64;
+              taskMeta.textContent = JSON.stringify(data.meta, null, 2);
+              log("Task detected from backend");
+            } else {
+              log("WS message:", msg.data);
+            }
+          } catch {
+            log("WS raw:", msg.data);
+          }
+        };
+
         ws.onerror = (err) => log('WS error:', err);
         ws.onclose = () => log('WebSocket closed');
 
       } catch (e) {
-        log('Failed to start recording: ' + e);
+        log('Failed to start: ' + e);
         startBtn.disabled = false;
       }
     });
@@ -134,16 +162,19 @@
     stopBtn.addEventListener('click', () => {
       if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
       if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+
       mediaRecorder = null;
       ws = null;
       stopBtn.disabled = true;
       pauseBtn.disabled = true;
       startBtn.disabled = false;
+
       log('Recording stopped by user');
     });
 
     pauseBtn.addEventListener('click', () => {
       if (!mediaRecorder) return;
+
       if (mediaRecorder.state === 'recording') {
         mediaRecorder.pause();
         pauseBtn.textContent = 'Resume';
@@ -159,7 +190,7 @@
       if (ws && ws.readyState === WebSocket.OPEN) ws.close();
     });
 
-    log('Ready. Set backend WebSocket URL and press Start.');
+    log('Ready. Set backend WebSocket URL & press Start.');
   });
   </script>
 </body>
