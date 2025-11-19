@@ -84,7 +84,7 @@ async def analyze_video_background(video_bytes: bytes):
         # --- Define async tasks ---
         async def transcribe_task():
             # return await transcribe_video_with_deepgram(video_bytes) or ""
-            return ""
+            return "this is demo transcription"
 
         async def llm_task():
             video_b64 = base64.b64encode(video_bytes).decode()
