@@ -10,7 +10,7 @@ import socketio
 import cv2
 import tempfile
 from dotenv import load_dotenv
-from .transcribe import transcribe_video_with_whisper
+# from .transcribe import transcribe_video_bytes as transcribe_video_with_deepgram
 
 # ---------------------------------------------
 # INIT
@@ -83,7 +83,8 @@ async def analyze_video_background(video_bytes: bytes):
     try:
         # --- Define async tasks ---
         async def transcribe_task():
-            return await transcribe_video_with_whisper(video_bytes) or ""
+            # return await transcribe_video_with_deepgram(video_bytes) or ""
+            return ""
 
         async def llm_task():
             video_b64 = base64.b64encode(video_bytes).decode()
