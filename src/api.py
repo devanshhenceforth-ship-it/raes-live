@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, BackgroundTasks, HTTPException
 import base64
 import asyncio
 from langchain_core.messages import HumanMessage
@@ -10,6 +10,8 @@ import socketio
 import cv2
 import tempfile
 from dotenv import load_dotenv
+import httpx
+
 # from .transcribe import transcribe_video_bytes as transcribe_video_with_deepgram
 
 # ---------------------------------------------
@@ -18,6 +20,9 @@ from dotenv import load_dotenv
 load_dotenv()
 router = APIRouter()
 
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+
+
 # ---------- Schemas ---------- #
 class VideoEvent(BaseModel):
     timestamp: int
@@ -25,24 +30,33 @@ class VideoEvent(BaseModel):
     description: str
     category: str
 
+
 class AllAnalyzerResponse(BaseModel):
-    issues: List[VideoEvent] = Field(..., description="List of identified tasks or issues.")
+    issues: List[VideoEvent] = Field(
+        ..., description="List of identified tasks or issues."
+    )
     summary: Optional[str] = Field(None, description="Summary of the analysis.")
 
+
 # ---------- Global LLM Setup ---------- #
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=os.getenv("GOOGLE_API_KEY"))
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash", api_key=os.getenv("GOOGLE_API_KEY")
+)
 structured_llm = llm.with_structured_output(AllAnalyzerResponse)
 
 # ---------- Socket.IO Server ---------- #
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
+
 @sio.event
 async def connect(sid, environ):
     print("[SOCKET] Client connected:", sid)
 
+
 @sio.event
 async def disconnect(sid):
     print("[SOCKET] Client disconnected:", sid)
+
 
 # ---------------------------------------------
 # BASE64 UTILITY
@@ -54,10 +68,12 @@ def decode_base64(data: str) -> bytes:
         data += "=" * (4 - missing_padding)
     return base64.b64decode(data)
 
+
 def frame_to_base64(frame) -> str:
     """Convert an OpenCV frame to base64 JPEG"""
     _, buffer = cv2.imencode(".jpg", frame)
     return base64.b64encode(buffer).decode()
+
 
 def get_frame_at_timestamp(video_bytes: bytes, timestamp: int) -> Optional[str]:
     """Extract a frame at the given timestamp (ms) from video bytes"""
@@ -75,6 +91,7 @@ def get_frame_at_timestamp(video_bytes: bytes, timestamp: int) -> Optional[str]:
         if ret:
             return frame_to_base64(frame)
     return None
+
 
 # ---------------------------------------------
 # BACKGROUND ANALYSIS FUNCTION (PARALLEL)
@@ -104,10 +121,7 @@ async def analyze_video_background(video_bytes: bytes):
             return await asyncio.to_thread(structured_llm.invoke, [message])
 
         # --- Run both tasks concurrently ---
-        transcription, llm_result = await asyncio.gather(
-            transcribe_task(),
-            llm_task()
-        )
+        transcription, llm_result = await asyncio.gather(transcribe_task(), llm_task())
 
         # --- Add screenshots for frontend ---
         issues_with_screenshots = []
@@ -121,7 +135,7 @@ async def analyze_video_background(video_bytes: bytes):
         response_payload = {
             "issues": issues_with_screenshots,
             "summary": llm_result.summary,
-            "transcription": transcription
+            "transcription": transcription,
         }
 
         await sio.emit("task_detected", response_payload)
@@ -129,6 +143,46 @@ async def analyze_video_background(video_bytes: bytes):
     except Exception as e:
         print("[VIDEO_ANALYSIS] Background Error:", e)
         await sio.emit("task_error", {"error": str(e)})
+
+
+def extract_transcript(deepgram_response: dict) -> str:
+    """
+    Extracts the main transcript text from a Deepgram transcription response.
+    """
+    try:
+        # Navigate to the first channel, first alternative
+        return deepgram_response["results"]["channels"][0]["alternatives"][0][
+            "transcript"
+        ]
+    except (KeyError, IndexError):
+        return ""
+
+
+async def transcribe_video(video_bytes: bytes, content_type: str):
+    """
+    Send video/audio bytes to Deepgram and return transcription JSON.
+    """
+    url = "https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true"
+
+    headers = {
+        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Content-Type": content_type,  # 'video/mp4' or 'audio/wav' etc.
+    }
+
+    timeout = httpx.Timeout(connect=10.0, read=120.0, write=300.0, pool=120.0)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            response = await client.post(url, headers=headers, content=video_bytes)
+            response.raise_for_status()
+            return extract_transcript(response.json())
+        except httpx.HTTPStatusError as e:
+            # Log the Deepgram response body for debugging
+            print("Deepgram returned error:", e.response.text)
+            raise HTTPException(
+                status_code=e.response.status_code, detail=e.response.text
+            )
+
 
 # ---------------------------------------------
 # VIDEO UPLOAD ENDPOINT
@@ -142,10 +196,16 @@ async def upload_video(
     if not file:
         return {"error": "No video provided"}
 
+    content_type = file.content_type or "video/mp4"
     video_bytes = await file.read()
 
     # Start background task if sid is provided
     # if sid:
     background_tasks.add_task(analyze_video_background, video_bytes)
+    transcription = await transcribe_video(video_bytes, content_type)
 
-    return {"status": "ok", "message": "Video received. Analysis is running in background."}
+    return {
+        "status": "ok",
+        "message": "Video received. Analysis is running in background.",
+        "transcription": transcription,
+    }

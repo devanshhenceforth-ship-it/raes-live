@@ -11,3 +11,4 @@ python-socketio[asyncio]
 python-socketio[fastapi]
 python-multipart
 deepgram-sdk
+httpx
