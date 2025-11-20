@@ -135,7 +135,7 @@ async def analyze_video_background(video_bytes: bytes):
         response_payload = {
             "issues": issues_with_screenshots,
             "summary": llm_result.summary,
-            "transcription": transcription,
+            # "transcription": transcription,
         }
 
         await sio.emit("task_detected", response_payload)
